@@ -35,9 +35,11 @@ COLUMNS: list[tuple[str, str]] = [
     ("neighborhood", "Barrio"),
     ("address", "Dirección"),
     ("title", "Título"),
+    ("property_kind", "Tipo"),
     ("price", "Precio"),
     ("currency", "Moneda"),
     ("expenses", "Expensas"),
+    ("expenses_est", "Expensas est."),
     ("m2_covered", "M² Cubiertos"),
     ("m2_total", "M² Totales"),
     ("rooms", "Ambientes"),
@@ -55,7 +57,7 @@ COLUMNS: list[tuple[str, str]] = [
 HEADERS = [h for _, h in COLUMNS]
 
 # Formatos numéricos por encabezado
-CURRENCY_COLS = {"Precio", "Expensas"}
+CURRENCY_COLS = {"Precio", "Expensas", "Expensas est."}
 NUMBER_COLS = {
     "M² Cubiertos",
     "M² Totales",
@@ -67,21 +69,26 @@ NUMBER_COLS = {
 CURRENCY_FMT = '"$"#,##0'
 NUMBER_FMT = "#,##0.00"
 
+# Etiquetas legibles para el tipo de propiedad detectado.
+KIND_LABELS = {"departamento": "Depto", "ph": "PH", "casa": "Casa"}
+
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
+HYPERLINK_FONT = Font(color="0563C1", underline="single")
+
+
+def _cell_value(key: str, r: dict):
+    """Formatea el valor de una celda según la columna."""
+    if key == "en_pozo":
+        return "Sí" if r.get(key) else "No"
+    if key == "property_kind":
+        return KIND_LABELS.get(r.get(key), r.get(key))
+    return r.get(key)
 
 
 def _records_to_df(records: list[dict]) -> pd.DataFrame:
     """Convierte los registros a un DataFrame con las columnas finales."""
-    rows = []
-    for r in records:
-        rows.append(
-            {
-                header: ("Sí" if key == "en_pozo" and r.get(key) else
-                         ("No" if key == "en_pozo" else r.get(key)))
-                for key, header in COLUMNS
-            }
-        )
+    rows = [{header: _cell_value(key, r) for key, header in COLUMNS} for r in records]
     df = pd.DataFrame(rows, columns=HEADERS)
     return df
 
@@ -142,6 +149,16 @@ def _format_sheet(ws, df: pd.DataFrame) -> None:
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # --- URLs como hipervínculos reales (un solo click, sin editar la celda) ---
+    if "URL" in HEADERS:
+        url_col = HEADERS.index("URL") + 1
+        for row in range(2, n_rows + 2):
+            cell = ws.cell(row=row, column=url_col)
+            value = cell.value
+            if isinstance(value, str) and value.startswith("http"):
+                cell.hyperlink = value
+                cell.font = HYPERLINK_FONT
 
     # --- Congelar primera fila ---
     ws.freeze_panes = "A2"

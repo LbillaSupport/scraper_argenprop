@@ -17,6 +17,7 @@ import os
 import queue
 import threading
 import traceback
+import unicodedata
 
 import customtkinter as ctk
 
@@ -38,6 +39,15 @@ def _to_number(text: str):
         return None
 
 
+def _norm(text: str) -> str:
+    """Minúsculas y sin acentos, para buscar ubicaciones de forma tolerante."""
+    s = (text or "").strip().lower()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -55,8 +65,9 @@ class App(ctk.CTk):
         self.var_currency = ctk.StringVar(value="USD")
         self.var_types: dict[str, ctk.BooleanVar] = {}
         self.var_province = ctk.StringVar(value="CABA")
+        self.var_loc_filter = ctk.StringVar(value="")
         self.location_vars: dict[str, ctk.BooleanVar] = {}
-        self.location_checkboxes: list[ctk.CTkCheckBox] = []
+        self.location_checkboxes: list[tuple[str, ctk.CTkCheckBox]] = []
 
         self._build_layout()
         self._build_locations("CABA")
@@ -141,39 +152,85 @@ class App(ctk.CTk):
 
     def _build_location_panel(self, parent) -> None:
         frame = self._section(parent, "Ubicación (selección múltiple)")
+
+        # Buscador de texto: indispensable con 135 partidos cargados.
+        search = ctk.CTkEntry(
+            frame, textvariable=self.var_loc_filter,
+            placeholder_text="🔎 Filtrar ubicación… (ej: tigre, villa)",
+        )
+        search.pack(fill="x", padx=10, pady=(0, 4))
+        self.var_loc_filter.trace_add("write", lambda *_: self._filter_locations())
+
         # Botones de ayuda
         helper = ctk.CTkFrame(frame, fg_color="transparent")
         helper.pack(fill="x", padx=10, pady=(0, 4))
-        ctk.CTkButton(helper, text="Seleccionar todo", width=120, height=26,
+        ctk.CTkButton(helper, text="Seleccionar visibles", width=140, height=26,
                       command=lambda: self._set_all_locations(True)).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(helper, text="Limpiar", width=80, height=26,
+        ctk.CTkButton(helper, text="Limpiar visibles", width=120, height=26,
                       command=lambda: self._set_all_locations(False)).pack(side="left")
+
+        self.loc_count_label = ctk.CTkLabel(
+            frame, text="", anchor="w", font=ctk.CTkFont(size=11)
+        )
+        self.loc_count_label.pack(fill="x", padx=10, pady=(0, 2))
 
         self.location_container = ctk.CTkScrollableFrame(frame, height=180)
         self.location_container.pack(fill="x", padx=10, pady=(0, 8))
 
     def _build_locations(self, province: str) -> None:
         """(Re)construye los checkboxes de ubicaciones para la provincia dada."""
-        for cb in self.location_checkboxes:
+        for _, cb in self.location_checkboxes:
             cb.destroy()
         self.location_checkboxes.clear()
         self.location_vars.clear()
 
-        locations = config.LOCATIONS.get(province, {})
-        # Disposición en 2 columnas
-        for idx, name in enumerate(locations):
+        for name in config.LOCATIONS.get(province, {}):
             var = ctk.BooleanVar(value=False)
             self.location_vars[name] = var
-            cb = ctk.CTkCheckBox(self.location_container, text=name, variable=var)
-            cb.grid(row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=3)
-            self.location_checkboxes.append(cb)
+            cb = ctk.CTkCheckBox(
+                self.location_container, text=name, variable=var,
+                command=self._refresh_loc_count,
+            )
+            self.location_checkboxes.append((name, cb))
+        self._filter_locations()  # ubica los checkboxes según el filtro actual
+
+    def _filter_locations(self) -> None:
+        """Muestra solo las ubicaciones que matchean el texto del buscador.
+
+        Las selecciones se conservan aunque una ubicación quede oculta: así se
+        puede buscar, tildar, volver a buscar y seguir tildando.
+        """
+        query = _norm(self.var_loc_filter.get())
+        visible = 0
+        for name, cb in self.location_checkboxes:
+            if query in _norm(name):
+                cb.grid(row=visible // 2, column=visible % 2, sticky="w", padx=6, pady=3)
+                visible += 1
+            else:
+                cb.grid_remove()
+        self._refresh_loc_count(visible)
+
+    def _refresh_loc_count(self, visible: int | None = None) -> None:
+        total = len(self.location_checkboxes)
+        if visible is None:
+            query = _norm(self.var_loc_filter.get())
+            visible = sum(1 for name, _ in self.location_checkboxes if query in _norm(name))
+        selected = sum(1 for v in self.location_vars.values() if v.get())
+        self.loc_count_label.configure(
+            text=f"{visible}/{total} visibles · {selected} seleccionadas"
+        )
 
     def _on_province_change(self, province: str) -> None:
+        self.var_loc_filter.set("")  # reset del filtro al cambiar de provincia
         self._build_locations(province)
 
     def _set_all_locations(self, value: bool) -> None:
-        for var in self.location_vars.values():
-            var.set(value)
+        """Aplica a las ubicaciones VISIBLES (las que pasan el filtro actual)."""
+        query = _norm(self.var_loc_filter.get())
+        for name, var in self.location_vars.items():
+            if query in _norm(name):
+                var.set(value)
+        self._refresh_loc_count()
 
     def _build_filters(self, parent) -> None:
         frame = self._section(parent, "Filtros de búsqueda")
