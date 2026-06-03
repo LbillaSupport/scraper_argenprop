@@ -262,6 +262,26 @@ POZO_KEYWORDS = [
 ]
 
 # --------------------------------------------------------------------------- #
+#  Detección de financiación (el precio publicado suele ser el ANTICIPO)
+# --------------------------------------------------------------------------- #
+# Avisos con cuotas/financiación publican un precio bajo (la entrada) y el total
+# real es mayor. Se comparan sin acentos ni mayúsculas. OJO: NO incluir "apto
+# crédito" (eso es legítimo, no financiación del vendedor).
+FINANCING_KEYWORDS = [
+    "cuotas",
+    "en cuotas",
+    "cuota de",
+    "a la firma",
+    "anticipo",
+    "financiacion",
+    "financiado",
+    "financia directa",
+    "hipoteca sin banco",
+    "credito directo",
+    "credito sin banco",
+]
+
+# --------------------------------------------------------------------------- #
 #  Parámetros de scraping
 # --------------------------------------------------------------------------- #
 BASE_URL = "https://www.argenprop.com"

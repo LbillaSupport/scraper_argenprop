@@ -295,6 +295,7 @@ class ArgenpropScraper:
                     "card_title": self._card_text(card, ".card__title"),
                     "card_features": self._card_text(card, ".card__main-features"),
                     "card_neighborhood": self._guess_neighborhood(card),
+                    "card_image": self._card_image(card),
                     "card_raw": card_text,
                 }
             )
@@ -304,6 +305,21 @@ class ArgenpropScraper:
     def _card_text(card, selector: str) -> str:
         el = card.select_one(selector)
         return el.get_text(" ", strip=True) if el else ""
+
+    @staticmethod
+    def _card_image(card) -> str:
+        """URL de la primera foto del aviso (para los thumbnails de la galería)."""
+        img = card.find("img")
+        if not img:
+            return ""
+        src = (
+            img.get("data-src")
+            or img.get("src")
+            or (img.get("srcset", "").split()[0] if img.get("srcset") else "")
+        )
+        if src.startswith("//"):
+            src = "https:" + src
+        return src
 
     @staticmethod
     def _guess_neighborhood(card) -> str:
@@ -324,26 +340,43 @@ class ArgenpropScraper:
     ) -> list[dict]:
         """
         Recorre todas las páginas de TODAS las pasadas (dólares + pesos) y
-        devuelve las cards crudas, deduplicadas por URL conservando el orden.
+        devuelve las cards crudas, deduplicadas por URL y por contenido
+        (misma propiedad republicada con otra URL), conservando el orden.
         """
         all_cards: list[dict] = []
         seen: set[str] = set()
+        seen_fp: set[tuple] = set()
 
         for currency, pmin, pmax in self._search_passes(criteria):
             if self._cancelled():
                 break
             base_url = self.build_url(criteria, currency, pmin, pmax)
             self._log(f"URL de búsqueda ({currency or 'ambas monedas'}): {base_url}")
-            self._collect_pass(base_url, all_cards, seen, progress)
+            self._collect_pass(base_url, all_cards, seen, seen_fp, progress)
 
         self._log(f"Cards únicas encontradas: {len(all_cards)}")
         return all_cards
+
+    @staticmethod
+    def _card_fingerprint(card: dict) -> tuple | None:
+        """
+        Huella de contenido para detectar la MISMA propiedad republicada con
+        otra URL (mismo precio + título + características). Devuelve None si no
+        hay señal suficiente (para no colapsar avisos distintos por error).
+        """
+        price = " ".join((card.get("card_price") or "").lower().split())
+        title = " ".join((card.get("card_title") or "").lower().split())
+        feats = " ".join((card.get("card_features") or "").lower().split())
+        if not price or not (title or feats):
+            return None
+        return (price, title, feats)
 
     def _collect_pass(
         self,
         base_url: str,
         out: list[dict],
         seen: set[str],
+        seen_fp: set[tuple],
         progress: Callable[[str, int, int], None] | None,
     ) -> None:
         """Recorre las páginas de UNA pasada y agrega cards nuevas a `out`."""
@@ -357,9 +390,15 @@ class ArgenpropScraper:
 
         def add(cards: list[dict]) -> None:
             for c in cards:
-                if c["url"] not in seen:
-                    seen.add(c["url"])
-                    out.append(c)
+                if c["url"] in seen:
+                    continue
+                fp = self._card_fingerprint(c)
+                if fp is not None and fp in seen_fp:
+                    continue  # misma propiedad, otra URL
+                seen.add(c["url"])
+                if fp is not None:
+                    seen_fp.add(fp)
+                out.append(c)
 
         add(self.parse_cards(first))
         if progress:
@@ -486,20 +525,31 @@ class ArgenpropScraper:
             text = soup.get_text(" ", strip=True)
         return text
 
-    @staticmethod
-    def _extract_expenses(soup: BeautifulSoup) -> float | None:
+    # Expensas reales: tienen $ pegado al número ("Expensas: $119.000" o
+    # "+ $119.000 expensas"). Exigir el $ evita capturar los m² de la barra de
+    # avisos relacionados ("expensas 40 m² cubie."). Piso mínimo de seguridad.
+    MIN_EXPENSES = 1000
+    _EXPENSES_PATTERNS = (
+        re.compile(r"expensas\s*[:\-]?\s*\$\s*(\d[\d.,]*)", re.IGNORECASE),
+        re.compile(r"\$\s*(\d[\d.,]*)\s*(?:de\s+)?expensas", re.IGNORECASE),
+    )
+
+    @classmethod
+    def _extract_expenses(cls, soup: BeautifulSoup) -> float | None:
         # 1) Selector dedicado (camino rápido, sin recorrer toda la página).
         el = soup.select_one(".titlebar__expenses")
         if el:
             value = parse_number(el.get_text(" ", strip=True))
-            if value:
+            if value and value >= cls.MIN_EXPENSES:
                 return value
-        # 2) Sólo si hizo falta: patrón textual "Expensas: $100.000". Recién acá
-        #    extraemos el texto completo (es caro: lo evitamos cuando se puede).
+        # 2) Sólo si hizo falta: texto completo, exigiendo el signo $.
         page_text = soup.get_text(" ", strip=True)
-        m = re.search(r"Expensas[^\d]{0,20}(\d[\d.,]*)", page_text, re.IGNORECASE)
-        if m:
-            return parse_number(m.group(1))
+        for pattern in cls._EXPENSES_PATTERNS:
+            m = pattern.search(page_text)
+            if m:
+                value = parse_number(m.group(1))
+                if value and value >= cls.MIN_EXPENSES:
+                    return value
         return None
 
     # ------------------- scraping profundo concurrente -------------------- #

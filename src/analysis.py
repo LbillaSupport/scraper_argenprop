@@ -77,6 +77,88 @@ def property_kind(record: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+#  Financiación / cuotas (el precio publicado suele ser el ANTICIPO)
+# --------------------------------------------------------------------------- #
+def _parse_amount(raw: str) -> float | None:
+    """Convierte un número en formato argentino ('53.000', '1.234,5') a float."""
+    raw = raw.strip()
+    raw = raw.replace(".", "").replace(",", ".") if "," in raw else raw.replace(".", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+# "contado ... U$D 53.000" / "valor de contado $ 53.000.000"
+_CONTADO_RE = re.compile(
+    r"contado[^\d]{0,40}?(u\$?s|u\$?d|usd|\$)\s*(\d[\d.,]*)", re.IGNORECASE
+)
+
+
+def _extract_contado(text: str | None) -> tuple[float, str] | None:
+    """
+    Busca un precio 'de contado' en la descripción. Devuelve (valor, moneda)
+    donde moneda es 'USD' o '' (desconocida -> se asume la del aviso).
+    """
+    if not text:
+        return None
+    m = _CONTADO_RE.search(text)
+    if not m:
+        return None
+    value = _parse_amount(m.group(2))
+    if value is None:
+        return None
+    token = m.group(1).lower()
+    currency = "USD" if token.startswith("u") else ""
+    return value, currency
+
+
+def detect_financing(record: dict, rate: float | None) -> None:
+    """
+    Marca `financed` si el aviso vende con cuotas/financiación (el precio
+    publicado es el anticipo). Si encuentra el precio de CONTADO en la
+    descripción, corrige `price`/`price_usd` con ese valor real y marca
+    `price_corrected`.
+    """
+    hay = _norm_key(" ".join(
+        [
+            str(record.get("title") or ""),
+            str(record.get("card_title") or ""),
+            str(record.get("description") or ""),
+        ]
+    ))
+    if not any(kw in hay for kw in config.FINANCING_KEYWORDS):
+        return
+    record["financed"] = True
+
+    contado = _extract_contado(record.get("description"))
+    if not contado:
+        return
+    value, currency = contado
+    cur = currency or (record.get("currency") or "USD")
+    contado_usd = fx.to_usd(value, cur, rate)
+    if not contado_usd:
+        return
+
+    listed_usd = record.get("price_usd")
+    # Sensatez: el contado es mayor que el anticipo pero no disparatado (evita
+    # tomar un "$53.000.000" en pesos como si fueran 53 millones de dólares).
+    if listed_usd is None:
+        sane = 1_000 <= contado_usd <= 5_000_000
+    else:
+        sane = listed_usd < contado_usd <= listed_usd * 5
+    if not sane:
+        return
+
+    record["price"] = value
+    record["currency"] = cur
+    record["price_usd"] = contado_usd
+    record["usd_m2_covered"] = _safe_div(contado_usd, record.get("m2_covered"))
+    record["usd_m2_total"] = _safe_div(contado_usd, record.get("m2_total"))
+    record["price_corrected"] = True
+
+
+# --------------------------------------------------------------------------- #
 #  Métricas
 # --------------------------------------------------------------------------- #
 def _safe_div(numerator: float | None, denominator: float | None) -> float | None:
@@ -116,6 +198,10 @@ def compute_metrics(record: dict, rate: float | None = None) -> dict:
     record["zone_score"] = None
     record["en_pozo"] = is_en_pozo(record)
     record["property_kind"] = property_kind(record)
+
+    # Financiación: placeholders (se completan en detect_financing()).
+    record["financed"] = False
+    record["price_corrected"] = False
 
     # Expensas: placeholders. Si el aviso no las publica, se estiman en
     # `apply_scoring()` (necesita el conjunto completo para sacar la tarifa
@@ -393,12 +479,26 @@ def process(
     """
     ok: list[dict] = []
     pozo: list[dict] = []
+    financiado: list[dict] = []
 
     for raw in records:
         rec = compute_metrics(raw, rate)
         if rec["en_pozo"]:
             pozo.append(rec)
             continue
+
+        detect_financing(rec, rate)
+        if rec["financed"]:
+            financiado.append(rec)
+            # Si NO se pudo determinar el precio de contado, el publicado es el
+            # anticipo (no confiable): se separa del ranking.
+            if not rec["price_corrected"]:
+                continue
+
+        # Sin precio no se puede rankear: no entra al ranking ni a la galería.
+        if rec.get("price_usd") is None:
+            continue
+
         if passes_filters(rec, filters):
             ok.append(rec)
 
@@ -406,4 +506,4 @@ def process(
     # de propiedades terminadas, que es lo que se rankea.
     apply_scoring(ok)
 
-    return {"ok": ok, "pozo": pozo}
+    return {"ok": ok, "pozo": pozo, "financiado": financiado}

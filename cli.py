@@ -83,10 +83,13 @@ def main() -> None:
 
     records = scraper.scrape_details_parallel(cards, args.workers)
     grouped = analysis.process(records, filters, rate)
-    ok, pozo = grouped["ok"], grouped["pozo"]
-    _print(f"Terminadas: {len(ok)} · En pozo: {len(pozo)}")
+    ok, pozo, financiado = grouped["ok"], grouped["pozo"], grouped["financiado"]
+    _print(
+        f"Terminadas: {len(ok)} · En pozo: {len(pozo)} · "
+        f"Financiadas: {len(financiado)}"
+    )
 
-    path = exporter.export(ok, pozo, args.salida)
+    path = exporter.export(ok, pozo, financiado, args.salida)
     _print(f"Excel generado: {path}")
 
 

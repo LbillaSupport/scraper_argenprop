@@ -10,6 +10,7 @@ Hojas:
   MENOR_PRECIO   -> precio ascendente
   BAJAS_EXPENSAS -> expensas ascendente
   SCORE          -> score descendente
+  FINANCIADO     -> avisos con cuotas/financiación (precio = anticipo)
   EN_POZO        -> todas las detectadas en pozo
 
 Formato:
@@ -52,6 +53,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("zone_score", "Punt_Zona"),
     ("score", "Score"),
     ("en_pozo", "En_Pozo"),
+    ("financed", "Financiado"),
     ("description", "Descripción"),
 ]
 
@@ -84,7 +86,7 @@ USD_CELL_FILL = PatternFill("solid", fgColor="D5F0DC")
 
 def _cell_value(key: str, r: dict):
     """Formatea el valor de una celda según la columna."""
-    if key == "en_pozo":
+    if key in ("en_pozo", "financed"):
         return "Sí" if r.get(key) else "No"
     if key == "property_kind":
         return KIND_LABELS.get(r.get(key), r.get(key))
@@ -109,10 +111,16 @@ def _sorted(records: list[dict], key: str, ascending: bool) -> list[dict]:
     return sorted(records, key=sort_key, reverse=not ascending)
 
 
-def export(ok: list[dict], pozo: list[dict], path: str | None = None) -> str:
+def export(
+    ok: list[dict],
+    pozo: list[dict],
+    financiado: list[dict] | None = None,
+    path: str | None = None,
+) -> str:
     """
     Genera el Excel y devuelve la ruta del archivo creado.
     """
+    financiado = financiado or []
     if path is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"argenprop_{stamp}.xlsx"
@@ -129,6 +137,7 @@ def export(ok: list[dict], pozo: list[dict], path: str | None = None) -> str:
         "MENOR_PRECIO": _sorted(ok, "price_usd", ascending=True),
         "BAJAS_EXPENSAS": _sorted(ok, "expenses", ascending=True),
         "SCORE": _sorted(ok, "score", ascending=False),
+        "FINANCIADO": _sorted(financiado, "score", ascending=False),
         "EN_POZO": pozo,
     }
 

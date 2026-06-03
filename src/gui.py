@@ -14,16 +14,26 @@ actualizaciones de la UI se programan siempre con `self.after(...)`.
 from __future__ import annotations
 
 import difflib
+import io
 import os
 import queue
 import threading
 import traceback
 import unicodedata
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
+import requests
+from PIL import Image
 
 from . import analysis, config, exporter, fx
 from .scraper import ArgenpropScraper, SearchCriteria
+
+# Tamaño del thumbnail en la galería de resultados.
+THUMB_SIZE = (168, 120)
+# Cuántas tarjetas se muestran por tanda.
+RESULTS_BATCH = 30
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -61,6 +71,16 @@ class App(ctk.CTk):
         self.worker_thread: threading.Thread | None = None
         self.log_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
+        # Estado de la galería de resultados
+        self.results: list[dict] = []          # terminadas, ordenadas por score
+        self.results_shown = 0
+        self.last_excel_path: str | None = None
+        self._img_session = requests.Session()
+        self._img_session.headers.update({"User-Agent": config.USER_AGENT})
+        self._img_pool = ThreadPoolExecutor(max_workers=6)
+        self._img_refs: list[ctk.CTkImage] = []  # refs para que no las junte el GC
+        self._results_gen = 0                  # generación, para descartar cargas viejas
+
         # Variables de control
         self.var_operation = ctk.StringVar(value="Venta")
         self.var_currency = ctk.StringVar(value="USD")
@@ -73,6 +93,15 @@ class App(ctk.CTk):
         self._build_layout()
         self._build_locations("CABA")
         self.after(100, self._drain_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        """Cierre prolijo: corta descargas de imágenes pendientes."""
+        try:
+            self._img_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self.destroy()
 
     # ===================================================================== #
     #  Construcción de la interfaz
@@ -345,6 +374,7 @@ class App(ctk.CTk):
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         btn_row.grid_columnconfigure((0, 1), weight=1)
+        btn_row.grid_columnconfigure(2, weight=0)
 
         self.btn_search = ctk.CTkButton(
             btn_row, text="🔎  Buscar y exportar", height=44,
@@ -356,7 +386,13 @@ class App(ctk.CTk):
             btn_row, text="Cancelar", height=44, fg_color="#8B2E2E",
             hover_color="#6E2424", command=self._cancel_search, state="disabled"
         )
-        self.btn_cancel.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.btn_cancel.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+
+        self.btn_excel = ctk.CTkButton(
+            btn_row, text="📂 Excel", height=44, width=90, command=self._open_excel,
+            state="disabled", fg_color="#2E7D46", hover_color="#256138",
+        )
+        self.btn_excel.grid(row=0, column=2, sticky="ew")
 
         # Estado / progreso
         self.status_label = ctk.CTkLabel(parent, text="Listo.", anchor="w")
@@ -366,11 +402,25 @@ class App(ctk.CTk):
         self.progress.set(0)
         self.progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 8))
 
-        # Log
-        self.log_box = ctk.CTkTextbox(parent, wrap="word")
-        self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self.log_box.insert("end", "Configurá los criterios y presioná «Buscar y exportar».\n")
-        self.log_box.configure(state="disabled")
+        # Galería de resultados (reemplaza al log)
+        self.results_frame = ctk.CTkScrollableFrame(
+            parent, label_text="Mejores resultados (por score)"
+        )
+        self.results_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.results_frame.grid_columnconfigure(0, weight=1)
+        self._results_placeholder()
+
+    def _results_placeholder(self, text: str | None = None) -> None:
+        """Muestra un mensaje centrado cuando todavía no hay resultados."""
+        for child in self.results_frame.winfo_children():
+            child.destroy()
+        msg = text or (
+            "Configurá los criterios y presioná «Buscar y exportar».\n"
+            "Acá vas a ver las mejores propiedades, ordenadas por score."
+        )
+        ctk.CTkLabel(
+            self.results_frame, text=msg, text_color="gray", justify="center",
+        ).grid(row=0, column=0, pady=40, padx=10)
 
     # ===================================================================== #
     #  Logging / progreso (thread-safe vía cola)
@@ -389,10 +439,7 @@ class App(ctk.CTk):
             while True:
                 kind, payload = self.log_queue.get_nowait()
                 if kind == "log":
-                    self.log_box.configure(state="normal")
-                    self.log_box.insert("end", str(payload) + "\n")
-                    self.log_box.see("end")
-                    self.log_box.configure(state="disabled")
+                    print(str(payload), flush=True)  # detalle al terminal
                 elif kind == "status":
                     self.status_label.configure(text=str(payload))
                 elif kind == "progress":
@@ -468,7 +515,15 @@ class App(ctk.CTk):
 
         self.btn_search.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
+        self.btn_excel.configure(state="disabled")
         self.progress.set(0)
+
+        # Limpiar la galería anterior (e invalidar cargas de imágenes en vuelo).
+        self._results_gen += 1
+        self.results = []
+        self.results_shown = 0
+        self._img_refs.clear()
+        self._results_placeholder("Buscando… los resultados aparecerán al terminar.")
 
         self.scraper = ArgenpropScraper(log=self._log)
         self.worker_thread = threading.Thread(
@@ -539,8 +594,11 @@ class App(ctk.CTk):
             self._set_status("Calculando métricas y aplicando filtros…")
             self._set_progress(0.90)
             grouped = analysis.process(records, filters, rate)
-            ok, pozo = grouped["ok"], grouped["pozo"]
-            self._log(f"Terminadas (tras filtros): {len(ok)} · En pozo: {len(pozo)}")
+            ok, pozo, financiado = grouped["ok"], grouped["pozo"], grouped["financiado"]
+            self._log(
+                f"Terminadas: {len(ok)} · En pozo: {len(pozo)} · "
+                f"Financiadas: {len(financiado)}"
+            )
 
             # --- 4. Exportar ---
             self._set_status("Generando Excel…")
@@ -550,29 +608,219 @@ class App(ctk.CTk):
             from datetime import datetime
             fname = f"argenprop_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
             path = os.path.join(out_dir, fname)
-            exporter.export(ok, pozo, path)
+            exporter.export(ok, pozo, financiado, path)
+
+            # Las mejores primero, para la galería.
+            ranked = sorted(
+                ok, key=lambda r: (r.get("score") is None, -(r.get("score") or 0))
+            )
 
             self._set_progress(1.0)
-            self.log_queue.put(("done", {"path": path, "ok": len(ok), "pozo": len(pozo)}))
+            self.log_queue.put((
+                "done",
+                {
+                    "path": path, "ok": len(ok), "pozo": len(pozo),
+                    "financiado": len(financiado), "results": ranked,
+                },
+            ))
 
         except Exception:  # noqa: BLE001 - mostramos el error al usuario
             self._log("ERROR:\n" + traceback.format_exc())
-            self._set_status("Ocurrió un error (ver log).")
+            self._set_status("Ocurrió un error (ver consola).")
             self.log_queue.put(("done", None))
 
     def _on_finished(self, payload) -> None:
         self.btn_search.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
-        if payload:
-            self._set_status(
-                f"✔ Listo · {payload['ok']} terminadas · "
-                f"{payload['pozo']} en pozo. Excel generado."
+        if not payload:
+            if not self.results:
+                self._results_placeholder("Sin resultados para mostrar.")
+            return
+
+        self.status_label.configure(
+            text=f"✔ Listo · {payload['ok']} terminadas · "
+            f"{payload['pozo']} en pozo · {payload.get('financiado', 0)} financiadas "
+            f"· Excel guardado."
+        )
+        self.last_excel_path = payload["path"]
+        self.btn_excel.configure(state="normal")
+
+        self.results = payload["results"]
+        self.results_shown = 0
+        self._show_results()
+
+    # ===================================================================== #
+    #  Galería de resultados
+    # ===================================================================== #
+    def _show_results(self) -> None:
+        """(Re)dibuja la galería desde cero y muestra la primera tanda."""
+        for child in self.results_frame.winfo_children():
+            child.destroy()
+        self._img_refs.clear()
+        self.results_shown = 0
+        if not self.results:
+            self._results_placeholder("Ninguna propiedad pasó los filtros.")
+            return
+        self._render_more()
+
+    def _render_more(self) -> None:
+        """Dibuja la siguiente tanda de tarjetas y reubica el botón 'ver más'."""
+        if hasattr(self, "_more_btn") and self._more_btn.winfo_exists():
+            self._more_btn.destroy()
+
+        start = self.results_shown
+        end = min(start + RESULTS_BATCH, len(self.results))
+        for idx in range(start, end):
+            self._render_card(self.results[idx], idx + 1)
+        self.results_shown = end
+
+        remaining = len(self.results) - self.results_shown
+        if remaining > 0:
+            self._more_btn = ctk.CTkButton(
+                self.results_frame,
+                text=f"Ver más  ({remaining} restantes)",
+                command=self._render_more,
             )
-            self._log(f"\nArchivo: {payload['path']}")
+            self._more_btn.grid(row=self.results_shown, column=0, pady=10, padx=20, sticky="ew")
+
+    def _render_card(self, rec: dict, rank: int) -> None:
+        """Una tarjeta: foto + datos clave, clickeable para abrir el aviso."""
+        card = ctk.CTkFrame(self.results_frame)
+        card.grid(row=rank - 1, column=0, sticky="ew", padx=4, pady=4)
+        card.grid_columnconfigure(1, weight=1)
+
+        # --- Foto (placeholder hasta que cargue) ---
+        photo = ctk.CTkLabel(card, text="📷", width=THUMB_SIZE[0], height=THUMB_SIZE[1],
+                             fg_color="#2A2D2E", corner_radius=6)
+        photo.grid(row=0, column=0, rowspan=2, padx=8, pady=8)
+        self._load_thumb(rec.get("card_image"), photo)
+
+        # --- Encabezado: rank + score + precio ---
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=1, sticky="new", padx=(0, 10), pady=(8, 0))
+        head.grid_columnconfigure(1, weight=1)
+
+        score = rec.get("score")
+        ctk.CTkLabel(
+            head, text=f"#{rank}  ★ {score:.1f}" if score is not None else f"#{rank}",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=_score_color(score),
+        ).grid(row=0, column=0, sticky="w")
+
+        if rec.get("financed"):
+            ctk.CTkLabel(
+                head, text="💳 Contado", font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#D29922",
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        ctk.CTkLabel(
+            head, text=self._price_text(rec), font=ctk.CTkFont(size=14, weight="bold"),
+            anchor="e",
+        ).grid(row=0, column=2, sticky="e")
+
+        # --- Cuerpo: título, zona y datos ---
+        title = (rec.get("title") or rec.get("card_title") or "Sin título").strip()
+        ctk.CTkLabel(
+            card, text=title, font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w", justify="left", wraplength=360,
+        ).grid(row=1, column=1, sticky="nw", padx=(0, 10))
+
+        ctk.CTkLabel(
+            card, text=self._detail_text(rec), text_color="gray",
+            anchor="w", justify="left", wraplength=380,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
+
+        # Toda la tarjeta abre el aviso en el navegador.
+        url = rec.get("url")
+        if url:
+            self._bind_open(card, url)
+
+    @staticmethod
+    def _price_text(rec: dict) -> str:
+        price, cur = rec.get("price"), rec.get("currency") or ""
+        usd = rec.get("price_usd")
+        if price is None:
+            return "Precio s/d"
+        symbol = "US$" if cur == "USD" else "$"
+        base = f"{symbol} {price:,.0f}"
+        if rec.get("price_converted") and usd:
+            base += f"  (≈ US$ {usd:,.0f})"
+        return base
+
+    @staticmethod
+    def _detail_text(rec: dict) -> str:
+        kind = {"departamento": "Depto", "ph": "PH", "casa": "Casa"}.get(
+            rec.get("property_kind"), ""
+        )
+        bits = [b for b in [kind, rec.get("neighborhood")] if b]
+        if rec.get("m2_covered"):
+            bits.append(f"{rec['m2_covered']:.0f} m²")
+        if rec.get("rooms"):
+            bits.append(f"{rec['rooms']:.0f} amb")
+        exp = rec.get("expenses") or rec.get("expenses_est")
+        if exp:
+            tag = "" if rec.get("expenses") else " (est)"
+            bits.append(f"exp ${exp:,.0f}{tag}")
+        if rec.get("usd_m2_covered"):
+            bits.append(f"US$ {rec['usd_m2_covered']:,.0f}/m²")
+        return "   ·   ".join(bits)
+
+    def _bind_open(self, widget, url: str) -> None:
+        """Hace clickeable un widget y todos sus hijos (abre el aviso)."""
+        widget.configure(cursor="hand2")
+        widget.bind("<Button-1>", lambda _e: webbrowser.open(url))
+        for child in widget.winfo_children():
+            self._bind_open(child, url)
+
+    def _load_thumb(self, url: str | None, label: ctk.CTkLabel) -> None:
+        """Descarga el thumbnail en segundo plano y lo coloca al terminar."""
+        if not url:
+            return
+        gen = self._results_gen
+
+        def work():
             try:
-                os.startfile(os.path.dirname(payload["path"]))  # abre la carpeta (Windows)
+                resp = self._img_session.get(url, timeout=10)
+                if resp.status_code != 200:
+                    return
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            except Exception:
+                return
+            # El CTkImage se crea en el hilo principal (toca Tk).
+            self.after(0, lambda: self._place_thumb(label, img, gen))
+
+        self._img_pool.submit(work)
+
+    def _place_thumb(self, label: ctk.CTkLabel, pil_img, gen: int) -> None:
+        # Si arrancó otra búsqueda, descartamos la imagen vieja.
+        if gen != self._results_gen:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=THUMB_SIZE)
+            self._img_refs.append(ctk_img)
+            label.configure(image=ctk_img, text="")
+        except Exception:
+            pass
+
+    def _open_excel(self) -> None:
+        if self.last_excel_path:
+            try:
+                os.startfile(os.path.dirname(self.last_excel_path))  # Windows
             except Exception:
                 pass
+
+
+def _score_color(score) -> str:
+    """Verde si el score es alto, ámbar medio, gris si bajo/None."""
+    if score is None:
+        return "gray"
+    if score >= 70:
+        return "#3FB950"
+    if score >= 45:
+        return "#D29922"
+    return "#C9D1D9"
 
 
 def run() -> None:
