@@ -13,6 +13,7 @@ actualizaciones de la UI se programan siempre con `self.after(...)`.
 
 from __future__ import annotations
 
+import difflib
 import os
 import queue
 import threading
@@ -21,7 +22,7 @@ import unicodedata
 
 import customtkinter as ctk
 
-from . import analysis, config, exporter
+from . import analysis, config, exporter, fx
 from .scraper import ArgenpropScraper, SearchCriteria
 
 ctk.set_appearance_mode("System")
@@ -119,12 +120,19 @@ class App(ctk.CTk):
             ).pack(side="left", padx=(0, 16))
 
         cur_row = ctk.CTkFrame(frame, fg_color="transparent")
-        cur_row.pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkLabel(cur_row, text="Moneda del precio:").pack(side="left", padx=(0, 10))
+        cur_row.pack(fill="x", padx=10, pady=(0, 2))
+        ctk.CTkLabel(cur_row, text="Moneda del precio que ingresás:").pack(side="left", padx=(0, 10))
         for cur in config.CURRENCIES:
             ctk.CTkRadioButton(
                 cur_row, text=cur, variable=self.var_currency, value=cur
             ).pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(
+            frame, text="El precio se compara en ambas monedas usando el dólar "
+            "oficial: una propiedad en pesos que al cambio entra en tu rango, aparece.",
+            font=ctk.CTkFont(size=11), text_color="gray",
+            wraplength=430, justify="left", anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 8))
 
     def _on_operation_change(self) -> None:
         """Al cambiar la operación, sugiere la moneda habitual (editable)."""
@@ -194,27 +202,58 @@ class App(ctk.CTk):
             self.location_checkboxes.append((name, cb))
         self._filter_locations()  # ubica los checkboxes según el filtro actual
 
+    def _matching_locations(self, query: str) -> list[str]:
+        """
+        Ubicaciones que matchean el texto buscado (ya normalizado), tolerante:
+
+          1. Sin acentos ni mayúsculas: "moron" encuentra "Morón".
+          2. Por substring: "villa" lista todas las Villa *.
+          3. Si nada matchea por substring, cae a un acercamiento DIFUSO
+             (tolera errores de tipeo: "belgrno" -> "Belgrano").
+
+        Al tildar el checkbox se selecciona el nombre canónico, así que la
+        ubicación queda "autocorregida" sola.
+        """
+        names = [name for name, _ in self.location_checkboxes]
+        if not query:
+            return names
+
+        subs = [name for name in names if query in _norm(name)]
+        if subs:
+            return subs
+
+        scored: list[tuple[float, str]] = []
+        for name in names:
+            nn = _norm(name)
+            ratio = max(
+                [difflib.SequenceMatcher(None, query, nn).ratio()]
+                + [difflib.SequenceMatcher(None, query, w).ratio() for w in nn.split()]
+            )
+            if ratio >= 0.6:
+                scored.append((ratio, name))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [name for _, name in scored]
+
     def _filter_locations(self) -> None:
         """Muestra solo las ubicaciones que matchean el texto del buscador.
 
         Las selecciones se conservan aunque una ubicación quede oculta: así se
         puede buscar, tildar, volver a buscar y seguir tildando.
         """
-        query = _norm(self.var_loc_filter.get())
-        visible = 0
+        matches = self._matching_locations(_norm(self.var_loc_filter.get()))
+        matchset = set(matches)
+        cb_by_name = dict(self.location_checkboxes)
         for name, cb in self.location_checkboxes:
-            if query in _norm(name):
-                cb.grid(row=visible // 2, column=visible % 2, sticky="w", padx=6, pady=3)
-                visible += 1
-            else:
+            if name not in matchset:
                 cb.grid_remove()
-        self._refresh_loc_count(visible)
+        for i, name in enumerate(matches):
+            cb_by_name[name].grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=3)
+        self._refresh_loc_count(len(matches))
 
     def _refresh_loc_count(self, visible: int | None = None) -> None:
         total = len(self.location_checkboxes)
         if visible is None:
-            query = _norm(self.var_loc_filter.get())
-            visible = sum(1 for name, _ in self.location_checkboxes if query in _norm(name))
+            visible = len(self._matching_locations(_norm(self.var_loc_filter.get())))
         selected = sum(1 for v in self.location_vars.values() if v.get())
         self.loc_count_label.configure(
             text=f"{visible}/{total} visibles · {selected} seleccionadas"
@@ -226,14 +265,16 @@ class App(ctk.CTk):
 
     def _set_all_locations(self, value: bool) -> None:
         """Aplica a las ubicaciones VISIBLES (las que pasan el filtro actual)."""
-        query = _norm(self.var_loc_filter.get())
-        for name, var in self.location_vars.items():
-            if query in _norm(name):
-                var.set(value)
+        for name in self._matching_locations(_norm(self.var_loc_filter.get())):
+            self.location_vars[name].set(value)
         self._refresh_loc_count()
 
     def _build_filters(self, parent) -> None:
         frame = self._section(parent, "Filtros de búsqueda")
+        ctk.CTkLabel(
+            frame, text="Todos opcionales. Lo que dejes vacío no filtra.",
+            font=ctk.CTkFont(size=11), text_color="gray", anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 2))
         grid = ctk.CTkFrame(frame, fg_color="transparent")
         grid.pack(fill="x", padx=10, pady=(0, 8))
         grid.grid_columnconfigure((1, 3), weight=1)
@@ -264,11 +305,28 @@ class App(ctk.CTk):
         add_single(6, "Antigüedad (máx, años)", "age_max")
 
     def _build_workers(self, parent) -> None:
-        frame = self._section(parent, "Velocidad (workers concurrentes)")
+        frame = self._section(parent, "Velocidad de descarga")
+
+        # Explicación en lenguaje simple: qué hace y por qué existe esta perilla.
+        help_text = (
+            "Cuántas publicaciones se descargan AL MISMO TIEMPO. Más = termina "
+            "antes, pero satura: Argenprop puede frenarte y, en una PC lenta, la "
+            "app puede quedar en «no responde» un rato (no se rompe, sigue y "
+            "termina). 12–15 es un buen equilibrio: bajalo si se traba o ves "
+            "errores; subilo si va lento y todo viene funcionando."
+        )
+        ctk.CTkLabel(
+            frame, text=help_text, font=ctk.CTkFont(size=11), text_color="gray",
+            wraplength=430, justify="left", anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
         row = ctk.CTkFrame(frame, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(0, 10))
         self.var_workers = ctk.IntVar(value=config.DEFAULT_WORKERS)
         self.lbl_workers = ctk.CTkLabel(row, text=str(config.DEFAULT_WORKERS), width=30)
+
+        ctk.CTkLabel(row, text="Suave", font=ctk.CTkFont(size=11),
+                     text_color="gray").pack(side="left", padx=(0, 6))
         slider = ctk.CTkSlider(
             row,
             from_=config.MIN_WORKERS,
@@ -277,7 +335,9 @@ class App(ctk.CTk):
             variable=self.var_workers,
             command=lambda v: self.lbl_workers.configure(text=str(int(float(v)))),
         )
-        slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        slider.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkLabel(row, text="Rápido", font=ctk.CTkFont(size=11),
+                     text_color="gray").pack(side="left", padx=(0, 8))
         self.lbl_workers.pack(side="left")
 
     def _build_actions(self, parent) -> None:
@@ -365,22 +425,23 @@ class App(ctk.CTk):
             return None
 
         e = self.entries
-        price_min = _to_number(e["price_min"].get())
-        price_max = _to_number(e["price_max"].get())
+        # El precio se ingresa en la moneda elegida; la conversión a USD se hace
+        # en el hilo de trabajo (necesita la cotización online). Acá sólo lo
+        # guardamos crudo; los bounds de USD se completan en _run_pipeline.
+        self._price_input = (
+            self.var_currency.get(),               # "USD" / "Pesos"
+            _to_number(e["price_min"].get()),
+            _to_number(e["price_max"].get()),
+        )
 
         criteria = SearchCriteria(
             operation=config.OPERATIONS[self.var_operation.get()],
             property_types=selected_types,
             location_slugs=selected_locations,
-            currency=config.CURRENCIES[self.var_currency.get()],
-            price_min=int(price_min) if price_min else None,
-            price_max=int(price_max) if price_max else None,
             workers=int(self.var_workers.get()),
         )
 
         filters = analysis.Filters(
-            price_min=price_min,
-            price_max=price_max,
             m2_covered_min=_to_number(e["m2_covered_min"].get()),
             m2_covered_max=_to_number(e["m2_covered_max"].get()),
             m2_total_min=_to_number(e["m2_total_min"].get()),
@@ -425,6 +486,28 @@ class App(ctk.CTk):
     # ===================================================================== #
     def _run_pipeline(self, criteria: SearchCriteria, filters: analysis.Filters) -> None:
         try:
+            # --- 0. Cotización del dólar y rango de precio en USD ---
+            self._set_status("Consultando cotización del dólar…")
+            rate = fx.get_official_usd(self._log)
+            cur_label, raw_min, raw_max = self._price_input
+            # USD -> tal cual; Pesos -> a USD dividiendo por la cotización.
+            to_usd = (lambda v: v) if cur_label == "USD" else (lambda v: v / rate)
+            usd_min = to_usd(raw_min) if raw_min else None
+            usd_max = to_usd(raw_max) if raw_max else None
+
+            criteria.usd_rate = rate
+            criteria.price_min_usd = int(usd_min) if usd_min else None
+            criteria.price_max_usd = int(usd_max) if usd_max else None
+            filters.price_min = usd_min
+            filters.price_max = usd_max
+            if usd_min or usd_max:
+                self._log(
+                    f"Rango de precio en USD: "
+                    f"{int(usd_min) if usd_min else '–'} a "
+                    f"{int(usd_max) if usd_max else '–'} "
+                    f"(se busca en dólares y en pesos)."
+                )
+
             # --- 1. Listado ---
             self._set_status("Recolectando listado…")
 
@@ -455,7 +538,7 @@ class App(ctk.CTk):
             # --- 3. Métricas + filtros + pozo ---
             self._set_status("Calculando métricas y aplicando filtros…")
             self._set_progress(0.90)
-            grouped = analysis.process(records, filters)
+            grouped = analysis.process(records, filters, rate)
             ok, pozo = grouped["ok"], grouped["pozo"]
             self._log(f"Terminadas (tras filtros): {len(ok)} · En pozo: {len(pozo)}")
 
@@ -470,25 +553,25 @@ class App(ctk.CTk):
             exporter.export(ok, pozo, path)
 
             self._set_progress(1.0)
-            self.log_queue.put(("done", path))
+            self.log_queue.put(("done", {"path": path, "ok": len(ok), "pozo": len(pozo)}))
 
         except Exception:  # noqa: BLE001 - mostramos el error al usuario
             self._log("ERROR:\n" + traceback.format_exc())
             self._set_status("Ocurrió un error (ver log).")
             self.log_queue.put(("done", None))
 
-    def _on_finished(self, path) -> None:
+    def _on_finished(self, payload) -> None:
         self.btn_search.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
-        if path:
-            self._set_status(f"✔ Listo. Excel generado.")
-            self._log(f"\nArchivo: {path}")
+        if payload:
+            self._set_status(
+                f"✔ Listo · {payload['ok']} terminadas · "
+                f"{payload['pozo']} en pozo. Excel generado."
+            )
+            self._log(f"\nArchivo: {payload['path']}")
             try:
-                os.startfile(os.path.dirname(path))  # abre la carpeta (Windows)
+                os.startfile(os.path.dirname(payload["path"]))  # abre la carpeta (Windows)
             except Exception:
-                pass
-        else:
-            if not (self.scraper and self.scraper._cancelled()):
                 pass
 
 

@@ -38,6 +38,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("property_kind", "Tipo"),
     ("price", "Precio"),
     ("currency", "Moneda"),
+    ("price_usd", "Precio USD"),
     ("expenses", "Expensas"),
     ("expenses_est", "Expensas est."),
     ("m2_covered", "M² Cubiertos"),
@@ -58,6 +59,7 @@ HEADERS = [h for _, h in COLUMNS]
 
 # Formatos numéricos por encabezado
 CURRENCY_COLS = {"Precio", "Expensas", "Expensas est."}
+USD_COLS = {"Precio USD"}
 NUMBER_COLS = {
     "M² Cubiertos",
     "M² Totales",
@@ -67,6 +69,7 @@ NUMBER_COLS = {
     "Score",
 }
 CURRENCY_FMT = '"$"#,##0'
+USD_FMT = '"US$"#,##0'
 NUMBER_FMT = "#,##0.00"
 
 # Etiquetas legibles para el tipo de propiedad detectado.
@@ -75,6 +78,8 @@ KIND_LABELS = {"departamento": "Depto", "ph": "PH", "casa": "Casa"}
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 HYPERLINK_FONT = Font(color="0563C1", underline="single")
+# Para destacar la moneda de cada aviso (USD resalta sobre ARS).
+USD_CELL_FILL = PatternFill("solid", fgColor="D5F0DC")
 
 
 def _cell_value(key: str, r: dict):
@@ -121,7 +126,7 @@ def export(ok: list[dict], pozo: list[dict], path: str | None = None) -> str:
         "TODAS": ok,
         "OPORTUNIDADES": _sorted(ok, "usd_m2_covered", ascending=True),
         "MAYOR_M2": _sorted(ok, "m2_covered", ascending=False),
-        "MENOR_PRECIO": _sorted(ok, "price", ascending=True),
+        "MENOR_PRECIO": _sorted(ok, "price_usd", ascending=True),
         "BAJAS_EXPENSAS": _sorted(ok, "expenses", ascending=True),
         "SCORE": _sorted(ok, "score", ascending=False),
         "EN_POZO": pozo,
@@ -171,6 +176,8 @@ def _format_sheet(ws, df: pd.DataFrame) -> None:
     for col_idx, header in enumerate(HEADERS, start=1):
         if header in CURRENCY_COLS:
             fmt = CURRENCY_FMT
+        elif header in USD_COLS:
+            fmt = USD_FMT
         elif header in NUMBER_COLS:
             fmt = NUMBER_FMT
         else:
@@ -178,6 +185,14 @@ def _format_sheet(ws, df: pd.DataFrame) -> None:
         if fmt:
             for row in range(2, n_rows + 2):
                 ws.cell(row=row, column=col_idx).number_format = fmt
+
+    # --- Destacar la moneda: USD resalta sobre ARS ---
+    if "Moneda" in HEADERS:
+        mon_col = HEADERS.index("Moneda") + 1
+        for row in range(2, n_rows + 2):
+            cell = ws.cell(row=row, column=mon_col)
+            if str(cell.value).upper() == "USD":
+                cell.fill = USD_CELL_FILL
 
     # --- Ancho de columnas ajustado al contenido (con tope) ---
     for col_idx, header in enumerate(HEADERS, start=1):

@@ -271,12 +271,25 @@ DEFAULT_WORKERS = 15
 MIN_WORKERS = 10
 MAX_WORKERS = 20
 
-# Cota de seguridad: nunca recorrer más páginas que esto aunque el sitio
-# reporte más (evita búsquedas accidentales gigantescas).
-MAX_PAGES_HARD_LIMIT = 200
+# Cota ANTI-RUNAWAY: tope altísimo, sólo para evitar un bucle accidental si la
+# detección de páginas fallara. En la práctica NUNCA limita: se scrapean todas
+# las páginas que el sitio reporte, haya las que haya.
+MAX_PAGES_HARD_LIMIT = 100000
 
 REQUEST_TIMEOUT = 20  # segundos
 REQUEST_RETRIES = 3
+
+# --------------------------------------------------------------------------- #
+#  Cotización del dólar (para comparar precios USD/Pesos en una misma escala)
+# --------------------------------------------------------------------------- #
+# Se toma el dólar OFICIAL (venta) de DolarApi. Permite que una búsqueda por
+# rango de precio capture publicaciones en pesos que, al cambio, entran en el
+# rango en dólares (y viceversa), y destacar alquileres cotizados en USD.
+DOLARAPI_URL = "https://dolarapi.com/v1/dolares/oficial"
+
+# Respaldo si la API no responde (ARS por USD, dólar oficial venta). Es solo
+# una red de seguridad: el valor real se toma online en cada corrida.
+FX_USD_FALLBACK = 1450.0
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -18,7 +18,7 @@ import statistics
 import unicodedata
 from dataclasses import dataclass
 
-from . import config
+from . import config, fx
 
 
 # --------------------------------------------------------------------------- #
@@ -26,6 +26,7 @@ from . import config
 # --------------------------------------------------------------------------- #
 @dataclass
 class Filters:
+    # price_min/max van SIEMPRE en USD (escala canónica). El resto, en su unidad.
     price_min: float | None = None
     price_max: float | None = None
     m2_covered_min: float | None = None
@@ -86,21 +87,30 @@ def _safe_div(numerator: float | None, denominator: float | None) -> float | Non
     return round(numerator / denominator, 2)
 
 
-def compute_metrics(record: dict) -> dict:
+def compute_metrics(record: dict, rate: float | None = None) -> dict:
     """
     Agrega al registro las métricas que se calculan por propiedad de forma
-    aislada: usd_m2_covered, usd_m2_total y en_pozo.
+    aislada: price_usd, usd_m2_covered, usd_m2_total y en_pozo.
+
+    `rate` es la cotización (ARS por USD). Todo precio se lleva a USD para
+    poder comparar publicaciones en dólares y en pesos en la misma escala.
 
     El `score` y el `zone_score` NO se calculan acá: dependen del conjunto
     completo de resultados (normalización + mediana por zona) y se asignan
     luego en `apply_scoring()`. Acá quedan como placeholders en None.
     """
     price = record.get("price")
+    currency = record.get("currency") or ""
     m2_cov = record.get("m2_covered")
     m2_tot = record.get("m2_total")
 
-    record["usd_m2_covered"] = _safe_div(price, m2_cov)
-    record["usd_m2_total"] = _safe_div(price, m2_tot)
+    # Precio canónico en USD (lo que se compara, filtra y rankea).
+    price_usd = fx.to_usd(price, currency, rate)
+    record["price_usd"] = price_usd
+    record["price_converted"] = bool(rate and currency == "ARS" and price is not None)
+
+    record["usd_m2_covered"] = _safe_div(price_usd, m2_cov)
+    record["usd_m2_total"] = _safe_div(price_usd, m2_tot)
 
     record["score"] = None
     record["zone_score"] = None
@@ -151,8 +161,10 @@ def canonical_zone(neighborhood: str | None) -> str:
         return "Sin zona"
     if nk in _KNOWN_ZONES:
         return _KNOWN_ZONES[nk]
+    # Fallback por PALABRA COMPLETA: "Palermo Chico" -> "Palermo", pero sin que
+    # "pila" matchee "pilar" ni "san" matchee "san isidro".
     for known_nk, display in _KNOWN_ZONES.items():
-        if known_nk and (known_nk in nk or nk in known_nk):
+        if known_nk and re.search(rf"\b{re.escape(known_nk)}\b", nk):
             return display
     return (neighborhood or "").strip().title() or "Sin zona"
 
@@ -345,8 +357,10 @@ def _passes_max(value: float | None, maximum: float | None) -> bool:
 
 def passes_filters(record: dict, f: Filters) -> bool:
     checks = [
-        _passes_min(record.get("price"), f.price_min),
-        _passes_max(record.get("price"), f.price_max),
+        # El precio se compara SIEMPRE en USD (price_min/max son bounds en USD),
+        # así una propiedad en pesos que al cambio entra en el rango, pasa.
+        _passes_min(record.get("price_usd"), f.price_min),
+        _passes_max(record.get("price_usd"), f.price_max),
         _passes_min(record.get("m2_covered"), f.m2_covered_min),
         _passes_max(record.get("m2_covered"), f.m2_covered_max),
         _passes_min(record.get("m2_total"), f.m2_total_min),
@@ -364,21 +378,24 @@ def passes_filters(record: dict, f: Filters) -> bool:
 # --------------------------------------------------------------------------- #
 #  Pipeline de procesamiento
 # --------------------------------------------------------------------------- #
-def process(records: list[dict], filters: Filters) -> dict[str, list[dict]]:
+def process(
+    records: list[dict], filters: Filters, rate: float | None = None
+) -> dict[str, list[dict]]:
     """
     Procesa todos los registros y devuelve dos grupos:
         {"ok": [...], "pozo": [...]}
     'ok'   -> propiedades terminadas que pasaron los filtros.
     'pozo' -> propiedades en pozo (no se mezclan en el ranking principal).
 
-    Las propiedades en pozo NO se filtran por los criterios avanzados:
-    se reportan siempre todas las detectadas, según la especificación.
+    `rate` (ARS por USD) se usa para llevar cada precio a USD y comparar en una
+    misma escala. Las propiedades en pozo NO se filtran por los criterios
+    avanzados: se reportan siempre todas las detectadas.
     """
     ok: list[dict] = []
     pozo: list[dict] = []
 
     for raw in records:
-        rec = compute_metrics(raw)
+        rec = compute_metrics(raw, rate)
         if rec["en_pozo"]:
             pozo.append(rec)
             continue

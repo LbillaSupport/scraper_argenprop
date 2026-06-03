@@ -8,7 +8,8 @@ detectar oportunidades y exportar todo a Excel ya depurado y rankeado.
 
 - Búsqueda de **venta** o **alquiler**.
 - Filtro por **tipo** (Departamento / Casa / PH), **provincia** y **ubicación** (selección múltiple).
-- **Cobertura completa de zonas**: los 48 barrios de CABA, los **135 partidos** de Buenos Aires y las principales localidades de Córdoba (193 en total, orden alfabético). Como son muchas, la interfaz incluye un **buscador de texto** para filtrarlas.
+- **Cobertura completa de zonas**: los 48 barrios de CABA, los **135 partidos** de Buenos Aires y las principales localidades de Córdoba (193 en total, orden alfabético). Como son muchas, la interfaz incluye un **buscador de texto** (tolera acentos y errores de tipeo) para filtrarlas.
+- **Comparación en dólares**: convierte todos los precios a USD con el dólar oficial (DolarApi) y busca en **ambas monedas**, así una propiedad en pesos que al cambio entra en tu rango también aparece.
 - Filtros avanzados: precio, superficie cubierta/total, ambientes, dormitorios, expensas y antigüedad.
 - **Detección automática de páginas** (no usa un número fijo).
 - **Scraping profundo** de cada publicación (precio, expensas, ambientes, dormitorios, baños, antigüedad, superficies, dirección y descripción).
@@ -116,12 +117,29 @@ columna `Expensas est.` y muestra el tipo detectado en `Tipo`.
 Parámetros editables en `src/config.py`: `EXPENSE_AMENITY_BASE`,
 `EXPENSE_AMENITY_STEP`, `EXPENSE_AMENITY_MAX` y la lista `EXPENSE_AMENITY_GROUPS`.
 
-## Moneda
+## Moneda (USD / Pesos)
 
-Selector **USD / Pesos** en la interfaz. Cambia el slug de la URL
-(`dolares-…` / `pesos-…`) y se sugiere automáticamente según la operación
-(Venta → USD, Alquiler → Pesos), pero es editable. La columna `Moneda` del
-Excel refleja la moneda detectada en cada publicación.
+Todos los precios se comparan en **dólares**, usando la cotización del **dólar
+oficial** (DolarApi). Esto permite que el filtro de precio funcione *entre*
+monedas: si buscás hasta **50.000 USD**, también aparece una propiedad publicada
+**en pesos** que, al cambio, cuesta ≤ 50.000 USD (y se destacan los alquileres
+cotizados en dólares).
+
+Cómo funciona:
+
+1. Elegís en qué moneda ingresás el precio (**USD** o **Pesos**); el rango se
+   lleva a USD con la cotización.
+2. La búsqueda hace **dos pasadas** en Argenprop — una en dólares con el rango y
+   otra en pesos con el rango convertido — y junta los resultados sin duplicar.
+3. Cada aviso lleva un **`Precio USD`** canónico (columna del Excel). El `Score`
+   y el `$/m²` se calculan en USD, así no se mezclan monedas. La celda `Moneda`
+   se **resalta en verde cuando el aviso está en USD**.
+
+La cotización se toma online en cada corrida (`src/fx.py`); si DolarApi no
+responde, usa el respaldo `config.FX_USD_FALLBACK`. Para usar otro dólar (p. ej.
+MEP) basta cambiar `config.DOLARAPI_URL` (`/v1/dolares/bolsa`).
+
+En el **CLI**, `--moneda usd|pesos` indica en qué moneda van `--precio-min/max`.
 
 ## Estructura
 
@@ -132,9 +150,10 @@ SCRAPER_ARGENPROP/
 ├── requirements.txt
 ├── resultados/        # salidas .xlsx (se crea sola)
 └── src/
-    ├── config.py      # operaciones, tipos, provincias, ubicaciones, keywords
+    ├── config.py      # operaciones, tipos, provincias, ubicaciones, keywords, scoring
+    ├── fx.py          # cotización del dólar (DolarApi) y conversión a USD
     ├── scraper.py     # URL, paginación, cards, scraping profundo concurrente
-    ├── analysis.py    # métricas, score, detección en pozo, filtros
+    ├── analysis.py    # métricas, score, expensas, detección en pozo, filtros
     ├── exporter.py    # Excel multi-hoja con formato
     └── gui.py         # interfaz CustomTkinter
 ```

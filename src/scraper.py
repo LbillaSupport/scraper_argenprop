@@ -105,9 +105,12 @@ class SearchCriteria:
     operation: str = "venta"                 # slug: venta / alquiler
     property_types: list[str] = field(default_factory=list)  # slugs
     location_slugs: list[str] = field(default_factory=list)  # slugs
-    currency: str = "dolares"                # slug: dolares / pesos
-    price_min: int | None = None
-    price_max: int | None = None
+    # Rango de precio CANÓNICO en USD. Se busca tanto en dólares como en pesos
+    # (convirtiendo el rango con la cotización) para no perder publicaciones
+    # baratas en pesos que, al cambio, entran en el rango en dólares.
+    price_min_usd: int | None = None
+    price_max_usd: int | None = None
+    usd_rate: float | None = None            # ARS por USD (dólar oficial venta)
     workers: int = config.DEFAULT_WORKERS
 
 
@@ -137,44 +140,73 @@ class ArgenpropScraper:
         return self._cancel.is_set()
 
     # --------------------------- construcción URL ------------------------- #
-    def build_url(self, criteria: SearchCriteria) -> str:
+    def build_url(
+        self,
+        criteria: SearchCriteria,
+        currency: str | None = None,
+        pmin: int | None = None,
+        pmax: int | None = None,
+    ) -> str:
         """
-        Arma la URL base de búsqueda. Ejemplo resultante:
+        Arma la URL de una pasada de búsqueda. Ejemplo:
 
         https://www.argenprop.com/casas-o-departamentos-o-ph/venta/palermo-o-belgrano/dolares-10000-70000
+
+        `currency`/`pmin`/`pmax` definen el segmento de precio de ESA pasada.
+        Si `currency` es None (o no hay extremos), se omite el segmento y
+        Argenprop devuelve ambas monedas.
         """
         parts: list[str] = [config.BASE_URL]
 
-        # Tipos de propiedad unidos con "-o-"
         types = criteria.property_types or list(config.PROPERTY_TYPES.values())
         parts.append("-o-".join(types))
-
-        # Operación
         parts.append(criteria.operation)
 
-        # Ubicaciones unidas con "-o-"
         if criteria.location_slugs:
             parts.append("-o-".join(criteria.location_slugs))
 
-        # Precio en la moneda elegida (sólo si hay algún extremo)
-        price_segment = self._price_segment(
-            criteria.currency, criteria.price_min, criteria.price_max
-        )
+        price_segment = self._price_segment(currency, pmin, pmax)
         if price_segment:
             parts.append(price_segment)
 
         return "/".join(parts)
 
     @staticmethod
-    def _price_segment(currency: str, pmin: int | None, pmax: int | None) -> str:
-        cur = currency or "dolares"
+    def _price_segment(currency: str | None, pmin: int | None, pmax: int | None) -> str:
+        if not currency or (not pmin and not pmax):
+            return ""
         if pmin and pmax:
-            return f"{cur}-{pmin}-{pmax}"
-        if pmin and not pmax:
-            return f"{cur}-desde-{pmin}"
-        if pmax and not pmin:
-            return f"{cur}-hasta-{pmax}"
-        return ""
+            return f"{currency}-{pmin}-{pmax}"
+        if pmin:
+            return f"{currency}-desde-{pmin}"
+        return f"{currency}-hasta-{pmax}"
+
+    def _search_passes(
+        self, criteria: SearchCriteria
+    ) -> list[tuple[str | None, int | None, int | None]]:
+        """
+        Pasadas (moneda, pmin, pmax) a buscar para cubrir ambas monedas:
+
+          * Sin rango de precio -> 1 pasada sin segmento (Argenprop ya devuelve
+            dólares y pesos juntos).
+          * Con rango en USD -> 1 pasada en dólares con ese rango y otra en
+            pesos con el rango convertido por la cotización.
+        """
+        mn, mx = criteria.price_min_usd, criteria.price_max_usd
+        if not mn and not mx:
+            return [(None, None, None)]
+
+        passes: list[tuple[str | None, int | None, int | None]] = [("dolares", mn, mx)]
+        rate = criteria.usd_rate
+        if rate:
+            passes.append(
+                (
+                    "pesos",
+                    round(mn * rate) if mn else None,
+                    round(mx * rate) if mx else None,
+                )
+            )
+        return passes
 
     @staticmethod
     def page_url(base_url: str, page: int) -> str:
@@ -205,22 +237,32 @@ class ArgenpropScraper:
     # -------------------------- detección páginas ------------------------- #
     def detect_total_pages(self, soup: BeautifulSoup) -> int:
         """
-        Detecta la cantidad de páginas tomando el mayor número visible en
-        la paginación (Anterior 1 2 3 ... 29 Siguiente).
+        Detecta la cantidad de páginas (Anterior 1 2 3 … 29 Siguiente).
+
+        Señal CONFIABLE: los hrefs con `pagina-N`. No escaneamos cualquier
+        número de la página porque años ("2024"), precios o m² darían un total
+        disparatado (y sin tope eso escrapearía miles de páginas inexistentes).
         """
         numbers: list[int] = []
 
-        # 1) Links de paginación clásicos
-        for a in soup.select("a, span"):
-            text = a.get_text(strip=True)
-            if text.isdigit():
-                numbers.append(int(text))
-
-        # 2) Atributos data-* o hrefs con ?pagina-N
+        # 1) Hrefs con ?pagina-N -> el número real de página.
         for a in soup.find_all("a", href=True):
             m = re.search(r"pagina-(\d+)", a["href"])
             if m:
                 numbers.append(int(m.group(1)))
+
+        # 2) Sólo si no hubo hrefs, miramos los números DENTRO del bloque de
+        #    paginación (no de toda la página).
+        if not numbers:
+            pager = soup.select_one(
+                "[class*='pagination'], [class*='paginacion'], "
+                "[class*='pagination'], nav[aria-label*='pag']"
+            )
+            if pager:
+                for el in pager.select("a, span"):
+                    text = el.get_text(strip=True)
+                    if text.isdigit():
+                        numbers.append(int(text))
 
         if not numbers:
             return 1
@@ -281,44 +323,62 @@ class ArgenpropScraper:
         progress: Callable[[str, int, int], None] | None = None,
     ) -> list[dict]:
         """
-        Recorre todas las páginas del listado y devuelve las cards crudas.
-        `progress(stage, current, total)` se llama para reportar avance.
+        Recorre todas las páginas de TODAS las pasadas (dólares + pesos) y
+        devuelve las cards crudas, deduplicadas por URL conservando el orden.
         """
-        base_url = self.build_url(criteria)
-        self._log(f"URL de búsqueda: {base_url}")
+        all_cards: list[dict] = []
+        seen: set[str] = set()
 
+        for currency, pmin, pmax in self._search_passes(criteria):
+            if self._cancelled():
+                break
+            base_url = self.build_url(criteria, currency, pmin, pmax)
+            self._log(f"URL de búsqueda ({currency or 'ambas monedas'}): {base_url}")
+            self._collect_pass(base_url, all_cards, seen, progress)
+
+        self._log(f"Cards únicas encontradas: {len(all_cards)}")
+        return all_cards
+
+    def _collect_pass(
+        self,
+        base_url: str,
+        out: list[dict],
+        seen: set[str],
+        progress: Callable[[str, int, int], None] | None,
+    ) -> None:
+        """Recorre las páginas de UNA pasada y agrega cards nuevas a `out`."""
         first = self._fetch(base_url)
         if first is None:
-            self._log("No se pudo obtener la primera página.")
-            return []
+            self._log("No se pudo obtener la primera página de esta pasada.")
+            return
 
         total_pages = self.detect_total_pages(first)
         self._log(f"Páginas detectadas: {total_pages}")
 
-        all_cards: list[dict] = self.parse_cards(first)
+        def add(cards: list[dict]) -> None:
+            for c in cards:
+                if c["url"] not in seen:
+                    seen.add(c["url"])
+                    out.append(c)
+
+        add(self.parse_cards(first))
         if progress:
             progress("listado", 1, total_pages)
 
         for page in range(2, total_pages + 1):
             if self._cancelled():
                 break
-            url = self.page_url(base_url, page)
-            soup = self._fetch(url)
+            soup = self._fetch(self.page_url(base_url, page))
             if soup is not None:
-                all_cards.extend(self.parse_cards(soup))
+                page_cards = self.parse_cards(soup)
+                # Defensa: si una página viene SIN avisos, llegamos al final
+                # real (aunque la detección haya estimado de más). Cortamos.
+                if not page_cards:
+                    self._log(f"Página {page} sin avisos: fin del listado.")
+                    break
+                add(page_cards)
             if progress:
                 progress("listado", page, total_pages)
-
-        # Deduplicar por URL conservando orden.
-        seen: set[str] = set()
-        unique: list[dict] = []
-        for c in all_cards:
-            if c["url"] not in seen:
-                seen.add(c["url"])
-                unique.append(c)
-
-        self._log(f"Cards únicas encontradas: {len(unique)}")
-        return unique
 
     # ----------------------- scraping profundo ---------------------------- #
     def scrape_detail(self, card: dict) -> dict:
@@ -333,8 +393,6 @@ class ArgenpropScraper:
             return result
         result["detail_ok"] = True
 
-        page_text = soup.get_text(" ", strip=True)
-
         # --- Precio ---
         price_text = self._sel_text(soup, ".titlebar__price") or card.get("card_price", "")
         result["price"] = parse_number(price_text)
@@ -347,7 +405,7 @@ class ArgenpropScraper:
         )
 
         # --- Expensas ---
-        result["expenses"] = self._extract_expenses(soup, page_text)
+        result["expenses"] = self._extract_expenses(soup)
 
         # --- Características (zona de features del detalle) ---
         features_text = self._features_text(soup)
@@ -429,14 +487,16 @@ class ArgenpropScraper:
         return text
 
     @staticmethod
-    def _extract_expenses(soup: BeautifulSoup, page_text: str) -> float | None:
-        # 1) Selector dedicado
+    def _extract_expenses(soup: BeautifulSoup) -> float | None:
+        # 1) Selector dedicado (camino rápido, sin recorrer toda la página).
         el = soup.select_one(".titlebar__expenses")
         if el:
             value = parse_number(el.get_text(" ", strip=True))
             if value:
                 return value
-        # 2) Patrón textual: "Expensas: $100.000"
+        # 2) Sólo si hizo falta: patrón textual "Expensas: $100.000". Recién acá
+        #    extraemos el texto completo (es caro: lo evitamos cuando se puede).
+        page_text = soup.get_text(" ", strip=True)
         m = re.search(r"Expensas[^\d]{0,20}(\d[\d.,]*)", page_text, re.IGNORECASE)
         if m:
             return parse_number(m.group(1))
